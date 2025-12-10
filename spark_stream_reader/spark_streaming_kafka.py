@@ -1,8 +1,7 @@
 import os
 import logging
-import random
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, from_unixtime
+from pyspark.sql.functions import from_json, col, from_unixtime, to_timestamp
 from pyspark.sql.types import StructType, StringType, DoubleType, LongType
 
 # Define schema
@@ -19,19 +18,21 @@ schema = (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("SparkStreamingKafka")
 
-logger.info("Starting Spark Streaming Kafka application.")
+logger.info("Starting Spark Streaming Kafka application with MongoDB.")
 
 spark = SparkSession.builder \
-    .appName("IoT Kafka Spark Stream") \
+    .appName("IoT Kafka Spark MongoDB Stream") \
     .master("local[*]") \
+    .config("spark.mongodb.write.connection.uri", "mongodb://localhost:27017/iot_pipeline.sensor_data") \
+    .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.13:10.2.0") \
     .getOrCreate()
 
 # Get Kafka broker and topic from environment variables
-kafka_broker = os.getenv("KAFKA_BROKER", "host.docker.internal:9092")  # Default to localhost:9092 if not set
-kafka_topic = os.getenv("KAFKA_TOPIC", "iot-data")  # Default to "iot-data" if not set
-bucket_name = os.getenv("BUCKET_NAME", "iot-temperature-bucket")  # Default to "iot-data-bucket" if not set
+kafka_broker = os.getenv("KAFKA_BROKER", "localhost:9092")
+kafka_topic = os.getenv("KAFKA_TOPIC", "iot-data")
 
-logger.info(f"Kafka broker: {kafka_broker}, Topic: {kafka_topic}, Bucket: {bucket_name}")
+logger.info(f"Kafka broker: {kafka_broker}, Topic: {kafka_topic}")
+logger.info(f"MongoDB: mongodb://localhost:27017/iot_pipeline.sensor_data")
 
 try:
     # Read stream from Kafka
@@ -43,19 +44,26 @@ try:
     # Deserialize and process
     json_df = df.selectExpr("CAST(value AS STRING)").select(from_json(col("value"), schema).alias("data")).select("data.*")
 
-    # Add date column for partitioning
-    json_df = json_df.withColumn("date", from_unixtime(col("timestamp"), "yyyy-MM-dd"))
+    # Convert timestamp to proper datetime
+    json_df = json_df.withColumn("timestamp", to_timestamp(col("timestamp")))
+    json_df = json_df.withColumn("date", from_unixtime(col("timestamp").cast("long"), "yyyy-MM-dd"))
 
-    # Simulate random errors
-    if random.random() < 0.1:  # 10% chance of raising an error
-        raise RuntimeError("Simulated random error in Spark Streaming application.")
+    # Write to MongoDB
+    def write_to_mongodb(batch_df, batch_id):
+        batch_df.write \
+            .format("mongodb") \
+            .mode("append") \
+            .option("database", "iot_pipeline") \
+            .option("collection", "sensor_data") \
+            .save()
+        logger.info(f"Batch {batch_id}: Wrote {batch_df.count()} records to MongoDB")
 
     query = json_df.writeStream \
+        .foreachBatch(write_to_mongodb) \
         .outputMode("append") \
-        .format("console") \
         .start()
 
-    logger.info("Spark Streaming application is running.")
+    logger.info("Spark Streaming application is running and writing to MongoDB.")
     query.awaitTermination()
 except Exception as e:
     logger.error(f"An error occurred: {e}", exc_info=True)
