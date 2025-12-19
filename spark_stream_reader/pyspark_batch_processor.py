@@ -1,55 +1,49 @@
-from pyspark.sql import SparkSession
 from pymongo import MongoClient
+from collections import defaultdict
 import time
 
-print("🚀 Starting PySpark batch processing on MongoDB data...")
-
-spark = SparkSession.builder \
-    .appName("IoT Data Batch Analytics") \
-    .master("local[*]") \
-    .getOrCreate()
-
-print("✅ Spark Session created")
-
-# Read from MongoDB
-client = MongoClient("mongodb://localhost:27017")
+client = MongoClient("mongodb://127.0.0.1:27017")
 db = client["iot_pipeline"]
 collection = db["sensor_data"]
-
-# Get all data as Python list (NO SPARK WORKERS NEEDED)
-data = list(collection.find({}, {"_id": 0}))
-print(f"📊 Loaded {len(data)} records from MongoDB\n")
-
-# Simple analytics WITHOUT Spark DataFrames
-from collections import defaultdict
 
 device_stats = defaultdict(lambda: {"temps": [], "humidity": []})
 city_stats = defaultdict(lambda: {"temps": [], "humidity": []})
 
-for record in data:
-    device_stats[record["device_id"]]["temps"].append(record["temperature"])
-    device_stats[record["device_id"]]["humidity"].append(record["humidity"])
-    city_stats[record["city_code"]]["temps"].append(record["temperature"])
-    city_stats[record["city_code"]]["humidity"].append(record["humidity"])
+def apply_record(r):
+    device_stats[r["device_id"]]["temps"].append(r["temperature"])
+    device_stats[r["device_id"]]["humidity"].append(r["humidity"])
+    city_stats[r["city_code"]]["temps"].append(r["temperature"])
+    city_stats[r["city_code"]]["humidity"].append(r["humidity"])
 
-print("📈 BATCH PROCESSING - Aggregated Analytics by Device:")
-print(f"{'Device ID':<15} {'Total Readings':<15} {'Avg Temp':<12} {'Max Temp':<12} {'Avg Humidity':<12}")
-print("-" * 70)
-for device_id, stats in sorted(device_stats.items())[:10]:
-    avg_temp = sum(stats["temps"]) / len(stats["temps"])
-    max_temp = max(stats["temps"])
-    avg_humidity = sum(stats["humidity"]) / len(stats["humidity"])
-    print(f"{device_id:<15} {len(stats['temps']):<15} {avg_temp:<12.2f} {max_temp:<12.2f} {avg_humidity:<12.2f}")
+def print_summary():
+    print("\n📈 LIVE - by Device (top 10)")
+    print(f"{'Device ID':<15} {'Total':<8} {'Avg Temp':<10} {'Max Temp':<10} {'Avg Hum':<10}")
+    print("-" * 65)
+    for device_id, stats in list(sorted(device_stats.items()))[:10]:
+        avg_temp = sum(stats["temps"]) / len(stats["temps"])
+        max_temp = max(stats["temps"])
+        avg_hum = sum(stats["humidity"]) / len(stats["humidity"])
+        print(f"{device_id:<15} {len(stats['temps']):<8} {avg_temp:<10.2f} {max_temp:<10.2f} {avg_hum:<10.2f}")
 
-print("\n📈 BATCH PROCESSING - Aggregated Analytics by City:")
-print(f"{'City Code':<15} {'Total Readings':<15} {'Avg Temp':<12} {'Avg Humidity':<12}")
-print("-" * 55)
-for city_code, stats in sorted(city_stats.items()):
-    avg_temp = sum(stats["temps"]) / len(stats["temps"])
-    avg_humidity = sum(stats["humidity"]) / len(stats["humidity"])
-    print(f"{city_code:<15} {len(stats['temps']):<15} {avg_temp:<12.2f} {avg_humidity:<12.2f}")
+# Bootstrap existing docs once
+last_ts = None
+for doc in collection.find({}, {"_id": 0}).sort("timestamp", 1):
+    apply_record(doc)
+    last_ts = doc.get("timestamp")
 
-print(f"\n✅ PySpark batch processing complete! Processed {len(data)} total records")
+print("✅ Bootstrapped. Polling for new inserts every 2 seconds...")
 
-client.close()
-spark.stop()
+while True:
+    query = {}
+    if last_ts is not None:
+        query = {"timestamp": {"$gt": last_ts}}
+
+    new_docs = list(collection.find(query, {"_id": 0}).sort("timestamp", 1))
+    if new_docs:
+        for doc in new_docs:
+            apply_record(doc)
+        last_ts = new_docs[-1]["timestamp"]
+        print(f"\n✅ New docs: {len(new_docs)} (latest timestamp={last_ts})")
+        print_summary()
+
+    time.sleep(2)
